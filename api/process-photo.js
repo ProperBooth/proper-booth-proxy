@@ -1,81 +1,183 @@
 // ============================================================
-// VERCEL PROXY — calls OpenAI's image-edits endpoint
+// VERCEL PROXY — supports OpenAI gpt-image-1 AND Google Gemini
+// (Nano Banana / gemini-2.5-flash-image). Optionally accepts a
+// second "reference_photo" for style/identity guidance.
 // ============================================================
 //
-// This is a Vercel serverless function. It receives a selfie +
-// prompt from The Proper Booth, calls OpenAI's gpt-image-1
-// image-edits endpoint, and returns the transformed image as
-// a base64 data URL.
+// Environment variables required on Vercel:
+//   OPENAI_API_KEY = sk-...     (for provider='openai')
+//   GEMINI_API_KEY = AIzaSy...  (for provider='gemini')
 //
-// Requires environment variable on Vercel:
-//   OPENAI_API_KEY = sk-...
+// Request body (POST):
+//   {
+//     photo:           "data:image/jpeg;base64,..."  (required, the selfie)
+//     prompt:          "Create a cinematic..."        (required)
+//     provider:        "openai" | "gemini"            (optional, default 'gemini')
+//     reference_photo: "data:image/jpeg;base64,..."  (optional, Image 2)
+//     size:            "1024x1024"                    (optional)
+//   }
 //
-// Place this file in your Vercel project at:
-//   /api/process-photo.js
-// It will be reachable at:
-//   https://your-vercel-project.vercel.app/api/process-photo
+// Response:
+//   { output_url: "data:image/...", provider: "openai" | "gemini" }
 // ============================================================
 
 export const config = {
-  // Vercel free Hobby tier supports up to 60-second timeouts
   maxDuration: 60
 };
 
 export default async function handler(req, res) {
-  // CORS — booth lives on a different domain (Netlify) and calls us
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  const { photo, reference_photo, prompt, provider, size } = req.body || {};
+  if (!photo || !prompt) {
+    return res.status(400).json({ error: 'Missing photo or prompt in body' });
   }
 
+  const selected = (provider || 'gemini').toLowerCase();
+  console.log('[proxy] Provider:', selected, '| Reference image:', !!reference_photo);
+
+  try {
+    if (selected === 'gemini') {
+      return await callGemini(res, { photo, reference_photo, prompt, size });
+    } else {
+      return await callOpenAI(res, { photo, reference_photo, prompt, size });
+    }
+  } catch (err) {
+    console.error('[proxy] Unhandled error:', err);
+    return res.status(500).json({ error: err.message || 'Unknown server error' });
+  }
+}
+
+// ============================================================
+// GOOGLE GEMINI (Nano Banana — gemini-2.5-flash-image GA)
+// ============================================================
+async function callGemini(res, { photo, reference_photo, prompt, size }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY not configured on server' });
+  }
+
+  const stripPrefix = s => s.includes(',') ? s.split(',')[1] : s;
+
+  const parts = [
+    { text: prompt },
+    { inline_data: { mime_type: 'image/jpeg', data: stripPrefix(photo) } }
+  ];
+
+  if (reference_photo) {
+    parts.push({ inline_data: { mime_type: 'image/jpeg', data: stripPrefix(reference_photo) } });
+  }
+
+  const body = {
+    contents: [{ parts }],
+    generationConfig: {
+      responseModalities: ['TEXT', 'IMAGE'],
+      imageConfig: { aspectRatio: '1:1' }
+    }
+  };
+
+  console.log('[gemini] Sending — prompt length:', prompt.length, 'images:', parts.length - 1);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 55000);
+
+  let response;
+  try {
+    response = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      }
+    );
+  } catch (err) {
+    clearTimeout(timer);
+    const msg = err.name === 'AbortError'
+      ? `Timed out after 55s — Gemini didn't respond`
+      : `Network: ${err.message || 'unknown'}`;
+    return res.status(504).json({ error: msg });
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    const errText = await response.text();
+    let parsed; try { parsed = JSON.parse(errText); } catch (e) { parsed = null; }
+    const detail = parsed?.error?.message || errText.slice(0, 400);
+    console.error('[gemini] Error', response.status, detail);
+    return res.status(response.status).json({
+      error: `Gemini ${response.status}`,
+      detail
+    });
+  }
+
+  const data = await response.json();
+  const candidates = data?.candidates || [];
+  console.log('[gemini] OK — candidates:', candidates.length);
+
+  const responseParts = candidates[0]?.content?.parts || [];
+  const imagePart = responseParts.find(p => p.inlineData || p.inline_data);
+
+  if (!imagePart) {
+    const textPart = responseParts.find(p => p.text);
+    const finishReason = candidates[0]?.finishReason || 'unknown';
+    const blockReason = data?.promptFeedback?.blockReason || '';
+    const detail = textPart ? textPart.text.slice(0, 120) : '(no text either)';
+    return res.status(500).json({
+      error: 'No image in Gemini response',
+      detail: `Finish:${finishReason} ${blockReason} Said:"${detail}"`
+    });
+  }
+
+  const inline = imagePart.inlineData || imagePart.inline_data;
+  const mime = inline.mimeType || inline.mime_type || 'image/png';
+  const output_url = `data:${mime};base64,${inline.data}`;
+
+  console.log('[gemini] Returning image — length:', output_url.length);
+
+  return res.status(200).json({ output_url, provider: 'gemini' });
+}
+
+// ============================================================
+// OPENAI (gpt-image-1 image-edits)
+// ============================================================
+async function callOpenAI(res, { photo, reference_photo, prompt, size }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return res.status(500).json({ error: 'OPENAI_API_KEY not configured on server' });
   }
 
-  const { photo, prompt, size } = req.body || {};
-  if (!photo || !prompt) {
-    return res.status(400).json({ error: 'Missing photo or prompt in body' });
-  }
+  const stripPrefix = s => s.includes(',') ? s.split(',')[1] : s;
+  const bufferFrom = s => Buffer.from(stripPrefix(s), 'base64');
 
-  // Strip the "data:image/jpeg;base64," prefix if present
-  const base64 = photo.includes(',') ? photo.split(',')[1] : photo;
-
-  let binaryBuffer;
-  try {
-    binaryBuffer = Buffer.from(base64, 'base64');
-  } catch (err) {
-    return res.status(400).json({ error: 'Photo base64 could not be decoded' });
-  }
-
-  // Build multipart form-data the way OpenAI expects.
-  // NOTE: gpt-image-1 edits endpoint does NOT accept `quality` or
-  // `response_format` parameters (those are images/generations-only).
   const formData = new FormData();
   formData.append('model', 'gpt-image-1');
   formData.append('prompt', String(prompt).slice(0, 32000));
   formData.append('n', '1');
   formData.append('size', size || '1024x1024');
   formData.append('output_format', 'jpeg');
-  formData.append('input_fidelity', 'high');
-  formData.append('image', new Blob([binaryBuffer], { type: 'image/jpeg' }), 'photo.jpg');
+  formData.append('input_fidelity', 'high'); // identity preservation
 
-  console.log('[proxy] Sending to OpenAI: prompt length', prompt.length, 'image bytes', binaryBuffer.length);
+  // OpenAI's edits endpoint accepts multiple images under "image[]"
+  formData.append('image', new Blob([bufferFrom(photo)], { type: 'image/jpeg' }), 'identity.jpg');
+  if (reference_photo) {
+    formData.append('image', new Blob([bufferFrom(reference_photo)], { type: 'image/jpeg' }), 'style.jpg');
+  }
 
-  // Hard timeout inside the function — keep below Vercel's max
+  console.log('[openai] Sending — prompt length:', prompt.length, 'images:', reference_photo ? 2 : 1);
+
   const controller = new AbortController();
-  const TIMEOUT_MS = 55000;
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), 55000);
 
-  let openaiRes;
+  let response;
   try {
-    openaiRes = await fetch('https://api.openai.com/v1/images/edits', {
+    response = await fetch('https://api.openai.com/v1/images/edits', {
       method: 'POST',
       headers: { Authorization: `Bearer ${apiKey}` },
       body: formData,
@@ -84,35 +186,30 @@ export default async function handler(req, res) {
   } catch (err) {
     clearTimeout(timer);
     const msg = err.name === 'AbortError'
-      ? `Timed out after ${TIMEOUT_MS / 1000}s — OpenAI didn't respond`
+      ? `Timed out after 55s — OpenAI didn't respond`
       : `Network: ${err.message || 'unknown'}`;
     return res.status(504).json({ error: msg });
   }
   clearTimeout(timer);
 
-  if (!openaiRes.ok) {
-    const errText = await openaiRes.text();
-    let parsed;
-    try { parsed = JSON.parse(errText); } catch (e) { parsed = null; }
+  if (!response.ok) {
+    const errText = await response.text();
+    let parsed; try { parsed = JSON.parse(errText); } catch (e) { parsed = null; }
     const detail = parsed?.error?.message || errText.slice(0, 400);
-    console.error('[proxy] OpenAI error', openaiRes.status, detail);
-    return res.status(openaiRes.status).json({
-      error: `OpenAI ${openaiRes.status}`,
+    return res.status(response.status).json({
+      error: `OpenAI ${response.status}`,
       detail
     });
   }
 
-  const data = await openaiRes.json();
-
-  console.log('[proxy] OpenAI 200, data length:', data?.data?.length);
-  console.log('[proxy] First item keys:', data?.data?.[0] ? Object.keys(data.data[0]) : 'none');
+  const data = await response.json();
+  console.log('[openai] OK — data length:', data?.data?.length);
 
   const item = data?.data?.[0];
   if (!item || (!item.b64_json && !item.url)) {
-    const detail = data?.error?.message || JSON.stringify(data).slice(0, 300);
     return res.status(500).json({
       error: 'No image in OpenAI response',
-      detail
+      detail: data?.error?.message || JSON.stringify(data).slice(0, 200)
     });
   }
 
@@ -120,7 +217,5 @@ export default async function handler(req, res) {
     ? `data:image/jpeg;base64,${item.b64_json}`
     : item.url;
 
-  console.log('[proxy] Returning image — type:', item.b64_json ? 'base64' : 'url', 'length:', output_url.length);
-
-  return res.status(200).json({ output_url });
+  return res.status(200).json({ output_url, provider: 'openai' });
 }
