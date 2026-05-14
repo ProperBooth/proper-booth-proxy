@@ -50,6 +50,8 @@ export default async function handler(req, res) {
   try {
     if (selected === 'gemini') {
       return await callGemini(res, { photo, references: refs, prompt, size });
+    } else if (selected === 'fal') {
+      return await callFal(res, { photo, references: refs, prompt, size });
     } else {
       return await callOpenAI(res, { photo, references: refs, prompt, size });
     }
@@ -228,4 +230,94 @@ async function callOpenAI(res, { photo, references, prompt, size }) {
     : item.url;
 
   return res.status(200).json({ output_url, provider: 'openai' });
+}
+
+// ============================================================
+// FAL.AI (FLUX.1 Kontext [pro] multi — best-in-class for
+// character consistency + multi-image conditioning)
+// ============================================================
+async function callFal(res, { photo, references, prompt, size }) {
+  const apiKey = process.env.FAL_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'FAL_API_KEY not configured on server' });
+  }
+
+  // FLUX Kontext multi accepts an array of data URLs.
+  // Image order: selfie (Image 1), then refs (kit Image 2, style Image 3).
+  const image_urls = [photo, ...(references || [])];
+
+  const body = {
+    prompt: String(prompt).slice(0, 5000),
+    image_urls: image_urls,
+    aspect_ratio: '1:1',
+    num_images: 1,
+    output_format: 'jpeg',
+    safety_tolerance: '5' // most permissive — for portraits of real people
+  };
+
+  console.log('[fal] Sending — prompt length:', prompt.length, 'total images:', image_urls.length);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 55000);
+
+  let response;
+  try {
+    response = await fetch('https://fal.run/fal-ai/flux-pro/kontext/max/multi', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Key ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    const msg = err.name === 'AbortError'
+      ? `Timed out after 55s — fal.ai didn't respond`
+      : `Network: ${err.message || 'unknown'}`;
+    return res.status(504).json({ error: msg });
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    const errText = await response.text();
+    let parsed; try { parsed = JSON.parse(errText); } catch (e) { parsed = null; }
+    const detail = parsed?.detail || parsed?.error || errText.slice(0, 400);
+    console.error('[fal] Error', response.status, detail);
+    return res.status(response.status).json({
+      error: `fal.ai ${response.status}`,
+      detail: typeof detail === 'string' ? detail : JSON.stringify(detail).slice(0, 400)
+    });
+  }
+
+  const data = await response.json();
+  console.log('[fal] OK — images:', data?.images?.length);
+
+  const imageUrl = data?.images?.[0]?.url;
+  if (!imageUrl) {
+    return res.status(500).json({
+      error: 'No image in fal.ai response',
+      detail: JSON.stringify(data).slice(0, 300)
+    });
+  }
+
+  // fal returns hosted URLs. Fetch and convert to a data URL so the
+  // browser doesn't have to deal with cross-origin canvas tainting.
+  let dataUrl;
+  try {
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) throw new Error(`fetch image ${imgRes.status}`);
+    const buf = await imgRes.arrayBuffer();
+    const b64 = Buffer.from(buf).toString('base64');
+    const ct = imgRes.headers.get('content-type') || 'image/jpeg';
+    dataUrl = `data:${ct};base64,${b64}`;
+  } catch (err) {
+    // Fallback: pass the URL through. Booth's <img crossOrigin="anonymous"> will handle it.
+    console.warn('[fal] Could not inline image, returning URL:', err.message);
+    dataUrl = imageUrl;
+  }
+
+  console.log('[fal] Returning image — length:', dataUrl.length);
+  return res.status(200).json({ output_url: dataUrl, provider: 'fal' });
 }
