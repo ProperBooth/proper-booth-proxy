@@ -164,10 +164,12 @@ async function callOpenAI(res, { photo, reference_photo, prompt, size }) {
   formData.append('output_format', 'jpeg');
   formData.append('input_fidelity', 'high'); // identity preservation
 
-  // OpenAI's edits endpoint accepts multiple images under "image[]"
-  formData.append('image', new Blob([bufferFrom(photo)], { type: 'image/jpeg' }), 'identity.jpg');
+  // OpenAI's edits endpoint: single image uses field name "image",
+  // multiple images use array notation "image[]".
+  const imageField = reference_photo ? 'image[]' : 'image';
+  formData.append(imageField, new Blob([bufferFrom(photo)], { type: 'image/jpeg' }), 'identity.jpg');
   if (reference_photo) {
-    formData.append('image', new Blob([bufferFrom(reference_photo)], { type: 'image/jpeg' }), 'style.jpg');
+    formData.append(imageField, new Blob([bufferFrom(reference_photo)], { type: 'image/jpeg' }), 'style.jpg');
   }
 
   console.log('[openai] Sending — prompt length:', prompt.length, 'images:', reference_photo ? 2 : 1);
