@@ -33,19 +33,25 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { photo, reference_photo, prompt, provider, size } = req.body || {};
+  const { photo, reference_photo, references, prompt, provider, size } = req.body || {};
   if (!photo || !prompt) {
     return res.status(400).json({ error: 'Missing photo or prompt in body' });
   }
 
+  // Normalise to an array of references.
+  // Accepts legacy single `reference_photo` OR new `references` array.
+  let refs = [];
+  if (Array.isArray(references)) refs = references.filter(Boolean);
+  else if (reference_photo) refs = [reference_photo];
+
   const selected = (provider || 'gemini').toLowerCase();
-  console.log('[proxy] Provider:', selected, '| Reference image:', !!reference_photo);
+  console.log('[proxy] Provider:', selected, '| Reference images:', refs.length);
 
   try {
     if (selected === 'gemini') {
-      return await callGemini(res, { photo, reference_photo, prompt, size });
+      return await callGemini(res, { photo, references: refs, prompt, size });
     } else {
-      return await callOpenAI(res, { photo, reference_photo, prompt, size });
+      return await callOpenAI(res, { photo, references: refs, prompt, size });
     }
   } catch (err) {
     console.error('[proxy] Unhandled error:', err);
@@ -56,7 +62,7 @@ export default async function handler(req, res) {
 // ============================================================
 // GOOGLE GEMINI (Nano Banana — gemini-2.5-flash-image GA)
 // ============================================================
-async function callGemini(res, { photo, reference_photo, prompt, size }) {
+async function callGemini(res, { photo, references, prompt, size }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return res.status(500).json({ error: 'GEMINI_API_KEY not configured on server' });
@@ -69,8 +75,9 @@ async function callGemini(res, { photo, reference_photo, prompt, size }) {
     { inline_data: { mime_type: 'image/jpeg', data: stripPrefix(photo) } }
   ];
 
-  if (reference_photo) {
-    parts.push({ inline_data: { mime_type: 'image/jpeg', data: stripPrefix(reference_photo) } });
+  // Append all reference images in order (Image 2, 3, etc.)
+  for (const ref of (references || [])) {
+    parts.push({ inline_data: { mime_type: 'image/jpeg', data: stripPrefix(ref) } });
   }
 
   const body = {
@@ -81,7 +88,7 @@ async function callGemini(res, { photo, reference_photo, prompt, size }) {
     }
   };
 
-  console.log('[gemini] Sending — prompt length:', prompt.length, 'images:', parts.length - 1);
+  console.log('[gemini] Sending — prompt length:', prompt.length, 'total images:', parts.length - 1);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 55000);
@@ -147,7 +154,7 @@ async function callGemini(res, { photo, reference_photo, prompt, size }) {
 // ============================================================
 // OPENAI (gpt-image-1 image-edits)
 // ============================================================
-async function callOpenAI(res, { photo, reference_photo, prompt, size }) {
+async function callOpenAI(res, { photo, references, prompt, size }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return res.status(500).json({ error: 'OPENAI_API_KEY not configured on server' });
@@ -166,13 +173,14 @@ async function callOpenAI(res, { photo, reference_photo, prompt, size }) {
 
   // OpenAI's edits endpoint: single image uses field name "image",
   // multiple images use array notation "image[]".
-  const imageField = reference_photo ? 'image[]' : 'image';
-  formData.append(imageField, new Blob([bufferFrom(photo)], { type: 'image/jpeg' }), 'identity.jpg');
-  if (reference_photo) {
-    formData.append(imageField, new Blob([bufferFrom(reference_photo)], { type: 'image/jpeg' }), 'style.jpg');
-  }
+  const allImages = [photo, ...(references || [])];
+  const imageField = allImages.length > 1 ? 'image[]' : 'image';
+  allImages.forEach((img, i) => {
+    const filename = i === 0 ? 'identity.jpg' : `reference-${i}.jpg`;
+    formData.append(imageField, new Blob([bufferFrom(img)], { type: 'image/jpeg' }), filename);
+  });
 
-  console.log('[openai] Sending — prompt length:', prompt.length, 'images:', reference_photo ? 2 : 1);
+  console.log('[openai] Sending — prompt length:', prompt.length, 'total images:', allImages.length);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 55000);
