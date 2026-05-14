@@ -63,7 +63,7 @@ export default async function handler(req, res) {
   formData.append('n', '1');
   formData.append('size', size || '1024x1024');
   formData.append('output_format', 'jpeg');
-  formData.append('input_fidelity', 'low');
+  formData.append('input_fidelity', 'high');
   formData.append('image', new Blob([binaryBuffer], { type: 'image/jpeg' }), 'photo.jpg');
 
   console.log('[proxy] Sending to OpenAI: prompt length', prompt.length, 'image bytes', binaryBuffer.length);
