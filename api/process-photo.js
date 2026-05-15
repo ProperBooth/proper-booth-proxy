@@ -52,6 +52,8 @@ export default async function handler(req, res) {
       return await callGemini(res, { photo, references: refs, prompt, size });
     } else if (selected === 'fal') {
       return await callFal(res, { photo, references: refs, prompt, size });
+    } else if (selected === 'fal-combined') {
+      return await callFalCombined(res, { photo, references: refs, prompt, size });
     } else {
       return await callOpenAI(res, { photo, references: refs, prompt, size });
     }
@@ -233,8 +235,11 @@ async function callOpenAI(res, { photo, references, prompt, size }) {
 }
 
 // ============================================================
-// FAL.AI (FLUX.1 Kontext [pro] multi — best-in-class for
-// character consistency + multi-image conditioning)
+// FAL.AI (FLUX.1 Kontext [max] — single-image edit)
+// We send ONLY the selfie as the base image. The kit + style are
+// described in the prompt text rather than as image refs, because
+// the /multi variant blends images instead of treating one as the
+// subject and the rest as references — wrong fit for our use case.
 // ============================================================
 async function callFal(res, { photo, references, prompt, size }) {
   const apiKey = process.env.FAL_API_KEY;
@@ -242,27 +247,27 @@ async function callFal(res, { photo, references, prompt, size }) {
     return res.status(500).json({ error: 'FAL_API_KEY not configured on server' });
   }
 
-  // FLUX Kontext multi accepts an array of data URLs.
-  // Image order: selfie (Image 1), then refs (kit Image 2, style Image 3).
-  const image_urls = [photo, ...(references || [])];
-
+  // Single-image Kontext: only the selfie. Kit reference is left out so it doesn't
+  // dominate the generation. Prompt's detailed kit description picks up the slack.
   const body = {
     prompt: String(prompt).slice(0, 5000),
-    image_urls: image_urls,
+    image_url: photo,
     aspect_ratio: '1:1',
     num_images: 1,
     output_format: 'jpeg',
-    safety_tolerance: '5' // most permissive — for portraits of real people
+    safety_tolerance: '5',
+    guidance_scale: 4.5 // a bit higher than default 3.5 — sticks more closely to the prompt
   };
 
-  console.log('[fal] Sending — prompt length:', prompt.length, 'total images:', image_urls.length);
+  console.log('[fal] Sending — prompt length:', prompt.length,
+              '(single-image kontext; refs ignored for this provider)');
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 55000);
 
   let response;
   try {
-    response = await fetch('https://fal.run/fal-ai/flux-pro/kontext/max/multi', {
+    response = await fetch('https://fal.run/fal-ai/flux-pro/kontext/max', {
       method: 'POST',
       headers: {
         'Authorization': `Key ${apiKey}`,
@@ -320,4 +325,149 @@ async function callFal(res, { photo, references, prompt, size }) {
 
   console.log('[fal] Returning image — length:', dataUrl.length);
   return res.status(200).json({ output_url: dataUrl, provider: 'fal' });
+}
+
+// ============================================================
+// FAL.AI COMBINED — Two-stage pipeline for accurate kit + face:
+//   Stage 1: FLUX Kontext Max — selfie → person in stadium scene
+//            with strong face preservation
+//   Stage 2: FASHN Try-On v1.6 — swap AI-imagined kit for the
+//            actual kit reference image (pixel-accurate garment)
+// ============================================================
+async function callFalCombined(res, { photo, references, prompt, size }) {
+  const apiKey = process.env.FAL_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'FAL_API_KEY not configured on server' });
+  }
+
+  const kitRef = references?.[0]; // first reference is the kit (by booth convention)
+
+  // ============ STAGE 1: FLUX Kontext Max ============
+  console.log('[fal-combined] Stage 1: FLUX Kontext Max — generating scene...');
+  const t1 = Date.now();
+
+  const controller1 = new AbortController();
+  const timer1 = setTimeout(() => controller1.abort(), 35000);
+
+  let stage1Res;
+  try {
+    stage1Res = await fetch('https://fal.run/fal-ai/flux-pro/kontext/max', {
+      method: 'POST',
+      headers: { Authorization: `Key ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt: String(prompt).slice(0, 5000),
+        image_url: photo,
+        aspect_ratio: '1:1',
+        num_images: 1,
+        output_format: 'jpeg',
+        safety_tolerance: '5',
+        guidance_scale: 4.5
+      }),
+      signal: controller1.signal
+    });
+  } catch (err) {
+    clearTimeout(timer1);
+    return res.status(504).json({
+      error: 'Stage 1 (FLUX Kontext) failed',
+      detail: err.name === 'AbortError' ? 'Timed out at 35s' : (err.message || 'unknown')
+    });
+  }
+  clearTimeout(timer1);
+
+  if (!stage1Res.ok) {
+    const errText = await stage1Res.text();
+    return res.status(stage1Res.status).json({
+      error: `Stage 1 (FLUX Kontext) ${stage1Res.status}`,
+      detail: errText.slice(0, 300)
+    });
+  }
+
+  const stage1Data = await stage1Res.json();
+  const stage1Url = stage1Data?.images?.[0]?.url;
+  if (!stage1Url) {
+    return res.status(500).json({
+      error: 'Stage 1 returned no image',
+      detail: JSON.stringify(stage1Data).slice(0, 300)
+    });
+  }
+
+  console.log('[fal-combined] Stage 1 done in', Date.now() - t1, 'ms — URL:', stage1Url.slice(0, 80));
+
+  // If there's no kit reference, return Stage 1 result as-is
+  if (!kitRef) {
+    console.log('[fal-combined] No kit reference — returning Stage 1 result.');
+    return res.status(200).json({
+      output_url: stage1Url,
+      provider: 'fal-combined',
+      note: 'No kit reference provided, returned FLUX Kontext result without try-on'
+    });
+  }
+
+  // ============ STAGE 2: FASHN Try-On v1.6 ============
+  console.log('[fal-combined] Stage 2: FASHN Try-On — swapping in real kit...');
+  const t2 = Date.now();
+
+  const controller2 = new AbortController();
+  const timer2 = setTimeout(() => controller2.abort(), 35000);
+
+  let stage2Res;
+  try {
+    stage2Res = await fetch('https://fal.run/fal-ai/fashn/tryon/v1.6', {
+      method: 'POST',
+      headers: { Authorization: `Key ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model_image: stage1Url,
+        garment_image: kitRef,
+        category: 'tops' // football jersey = top
+      }),
+      signal: controller2.signal
+    });
+  } catch (err) {
+    clearTimeout(timer2);
+    // Fallback: return Stage 1 result if try-on fails
+    console.warn('[fal-combined] Stage 2 failed, returning Stage 1:', err.message);
+    return res.status(200).json({
+      output_url: stage1Url,
+      provider: 'fal-combined',
+      warning: `Try-on failed: ${err.name === 'AbortError' ? 'timeout' : err.message}. Returned FLUX Kontext result.`
+    });
+  }
+  clearTimeout(timer2);
+
+  if (!stage2Res.ok) {
+    const errText = await stage2Res.text();
+    console.warn('[fal-combined] Stage 2 error', stage2Res.status, errText.slice(0, 200));
+    return res.status(200).json({
+      output_url: stage1Url,
+      provider: 'fal-combined',
+      warning: `Try-on returned ${stage2Res.status}: ${errText.slice(0, 200)}. Returned FLUX Kontext result.`
+    });
+  }
+
+  const stage2Data = await stage2Res.json();
+  const stage2Url = stage2Data?.images?.[0]?.url || stage2Data?.image?.url;
+  if (!stage2Url) {
+    console.warn('[fal-combined] Stage 2 returned no image, falling back');
+    return res.status(200).json({
+      output_url: stage1Url,
+      provider: 'fal-combined',
+      warning: 'Try-on returned no image. Returned FLUX Kontext result.'
+    });
+  }
+
+  console.log('[fal-combined] Stage 2 done in', Date.now() - t2, 'ms — URL:', stage2Url.slice(0, 80));
+
+  // Inline the final image as a data URL for the booth's canvas
+  let finalUrl;
+  try {
+    const imgRes = await fetch(stage2Url);
+    const buf = await imgRes.arrayBuffer();
+    const b64 = Buffer.from(buf).toString('base64');
+    const ct = imgRes.headers.get('content-type') || 'image/jpeg';
+    finalUrl = `data:${ct};base64,${b64}`;
+  } catch (err) {
+    finalUrl = stage2Url;
+  }
+
+  return res.status(200).json({ output_url: finalUrl, provider: 'fal-combined' });
 }
