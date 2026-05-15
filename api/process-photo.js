@@ -50,6 +50,8 @@ export default async function handler(req, res) {
   try {
     if (selected === 'gemini') {
       return await callGemini(res, { photo, references: refs, prompt, size });
+    } else if (selected === 'gemini-pro') {
+      return await callGeminiPro(res, { photo, references: refs, prompt, size });
     } else if (selected === 'fal') {
       return await callFal(res, { photo, references: refs, prompt, size });
     } else if (selected === 'fal-combined') {
@@ -235,6 +237,115 @@ async function callOpenAI(res, { photo, references, prompt, size }) {
 }
 
 // ============================================================
+// GEMINI PRO (Nano Banana Pro — gemini-3-pro-image-preview)
+// Uses the newer /v1beta/interactions endpoint with different
+// request/response shapes from the GA model. Higher quality,
+// slower, more expensive (~£0.05/image vs ~£0.02 for GA).
+// ============================================================
+async function callGeminiPro(res, { photo, references, prompt, size }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY not configured on server' });
+  }
+
+  const stripPrefix = s => s.includes(',') ? s.split(',')[1] : s;
+
+  const input = [
+    { type: 'text', text: prompt },
+    { type: 'image', mime_type: 'image/jpeg', data: stripPrefix(photo) }
+  ];
+
+  for (const ref of (references || [])) {
+    input.push({ type: 'image', mime_type: 'image/jpeg', data: stripPrefix(ref) });
+  }
+
+  const body = {
+    model: 'gemini-3-pro-image-preview',
+    input: input,
+    response_format: { type: 'image', aspect_ratio: '1:1' }
+  };
+
+  console.log('[gemini-pro] Sending — prompt length:', prompt.length, 'total images:', input.length - 1);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 55000);
+
+  let response;
+  try {
+    response = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/interactions',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      }
+    );
+  } catch (err) {
+    clearTimeout(timer);
+    const msg = err.name === 'AbortError'
+      ? `Timed out after 55s — Gemini Pro didn't respond`
+      : `Network: ${err.message || 'unknown'}`;
+    return res.status(504).json({ error: msg });
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    const errText = await response.text();
+    let parsed; try { parsed = JSON.parse(errText); } catch (e) { parsed = null; }
+    const detail = parsed?.error?.message || errText.slice(0, 400);
+    console.error('[gemini-pro] Error', response.status, detail);
+    return res.status(response.status).json({
+      error: `Gemini Pro ${response.status}`,
+      detail
+    });
+  }
+
+  const data = await response.json();
+  console.log('[gemini-pro] OK — response keys:', Object.keys(data || {}));
+
+  // Hunt for image across new Interactions API shapes
+  let imageData = null;
+  let mime = 'image/png';
+
+  const steps = data?.interaction?.steps || data?.steps || [];
+  for (const step of steps) {
+    const contents = step?.content || step?.contents || [];
+    for (const item of contents) {
+      if ((item.type === 'image' || item.type === 'IMAGE') && item.data) {
+        imageData = item.data;
+        mime = item.mime_type || item.mimeType || mime;
+        break;
+      }
+    }
+    if (imageData) break;
+  }
+
+  // Legacy fallback in case the API returns the older shape
+  if (!imageData) {
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    const imagePart = parts.find(p => p.inlineData || p.inline_data);
+    if (imagePart) {
+      const inline = imagePart.inlineData || imagePart.inline_data;
+      imageData = inline.data;
+      mime = inline.mimeType || inline.mime_type || mime;
+    }
+  }
+
+  if (!imageData) {
+    return res.status(500).json({
+      error: 'No image in Gemini Pro response',
+      detail: JSON.stringify(data).slice(0, 300)
+    });
+  }
+
+  return res.status(200).json({
+    output_url: `data:${mime};base64,${imageData}`,
+    provider: 'gemini-pro'
+  });
+}
+
+// ============================================================
 // FAL.AI (FLUX.1 Kontext [max] — single-image edit)
 // We send ONLY the selfie as the base image. The kit + style are
 // described in the prompt text rather than as image refs, because
@@ -361,7 +472,9 @@ async function callFalCombined(res, { photo, references, prompt, size }) {
         num_images: 1,
         output_format: 'jpeg',
         safety_tolerance: '5',
-        guidance_scale: 4.5
+        // Lower guidance scale = sticks LESS to the prompt's exact wording,
+        // preserves MORE of the input image's identity. 2.5 prioritises face.
+        guidance_scale: 2.5
       }),
       signal: controller1.signal
     });
@@ -418,7 +531,12 @@ async function callFalCombined(res, { photo, references, prompt, size }) {
       body: JSON.stringify({
         model_image: stage1Url,
         garment_image: kitRef,
-        category: 'tops' // football jersey = top
+        category: 'tops',                  // football jersey = top
+        garment_photo_type: 'flat-lay',    // our kits are product shots, not worn on a model
+        mode: 'quality',                   // best output (slightly slower)
+        restore_background: true,          // KEEP the stadium scene from Stage 1
+        num_samples: 1,
+        output_format: 'jpeg'
       }),
       signal: controller2.signal
     });
