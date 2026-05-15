@@ -303,26 +303,79 @@ async function callGeminiPro(res, { photo, references, prompt, size }) {
 
   const data = await response.json();
   console.log('[gemini-pro] OK — response keys:', Object.keys(data || {}));
+  console.log('[gemini-pro] status:', data?.status, 'outputs count:', data?.outputs?.length);
+  if (data?.outputs?.[0]) {
+    console.log('[gemini-pro] First output keys:', Object.keys(data.outputs[0]));
+  }
 
-  // Hunt for image across new Interactions API shapes
+  // Hunt for image across ALL plausible Gemini response shapes
   let imageData = null;
+  let imageUrl = null;
   let mime = 'image/png';
 
-  const steps = data?.interaction?.steps || data?.steps || [];
-  for (const step of steps) {
-    const contents = step?.content || step?.contents || [];
-    for (const item of contents) {
-      if ((item.type === 'image' || item.type === 'IMAGE') && item.data) {
+  // NEW Pro response shape: data.outputs[]
+  const outputs = data?.outputs || [];
+  for (const output of outputs) {
+    // Most likely shape: outputs[].image.data (base64) or .url
+    if (output?.image?.data) {
+      imageData = output.image.data;
+      mime = output.image.mime_type || output.image.mimeType || mime;
+      break;
+    }
+    if (output?.image?.url) {
+      imageUrl = output.image.url;
+      break;
+    }
+    // Alternative: directly on output
+    if (output?.b64_json) {
+      imageData = output.b64_json;
+      mime = output.mime_type || mime;
+      break;
+    }
+    if (output?.data && typeof output.data === 'string' && output.data.length > 100) {
+      imageData = output.data;
+      mime = output.mime_type || output.mimeType || mime;
+      break;
+    }
+    if (output?.url) {
+      imageUrl = output.url;
+      break;
+    }
+    // Content-style: outputs[].content[].image or .data
+    const contents = output?.content || output?.contents || [];
+    for (const item of (Array.isArray(contents) ? contents : [contents])) {
+      if (item?.type === 'image' && item?.data) {
         imageData = item.data;
         mime = item.mime_type || item.mimeType || mime;
         break;
       }
+      if (item?.image?.data) {
+        imageData = item.image.data;
+        mime = item.image.mime_type || mime;
+        break;
+      }
     }
-    if (imageData) break;
+    if (imageData || imageUrl) break;
   }
 
-  // Legacy fallback in case the API returns the older shape
-  if (!imageData) {
+  // Older Interactions API shape: data.interaction.steps[].content[]
+  if (!imageData && !imageUrl) {
+    const steps = data?.interaction?.steps || data?.steps || [];
+    for (const step of steps) {
+      const contents = step?.content || step?.contents || [];
+      for (const item of contents) {
+        if ((item.type === 'image' || item.type === 'IMAGE') && item.data) {
+          imageData = item.data;
+          mime = item.mime_type || item.mimeType || mime;
+          break;
+        }
+      }
+      if (imageData) break;
+    }
+  }
+
+  // Legacy generateContent shape
+  if (!imageData && !imageUrl) {
     const parts = data?.candidates?.[0]?.content?.parts || [];
     const imagePart = parts.find(p => p.inlineData || p.inline_data);
     if (imagePart) {
@@ -332,10 +385,23 @@ async function callGeminiPro(res, { photo, references, prompt, size }) {
     }
   }
 
+  // If we got a URL instead of base64, fetch and inline it
+  if (!imageData && imageUrl) {
+    try {
+      const imgRes = await fetch(imageUrl);
+      const buf = await imgRes.arrayBuffer();
+      imageData = Buffer.from(buf).toString('base64');
+      mime = imgRes.headers.get('content-type') || mime;
+    } catch (err) {
+      // Just return the URL and let the browser handle it
+      return res.status(200).json({ output_url: imageUrl, provider: 'gemini-pro' });
+    }
+  }
+
   if (!imageData) {
     return res.status(500).json({
       error: 'No image in Gemini Pro response',
-      detail: JSON.stringify(data).slice(0, 300)
+      detail: JSON.stringify(data).slice(0, 400)
     });
   }
 
